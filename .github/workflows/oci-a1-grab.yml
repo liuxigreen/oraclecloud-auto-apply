@@ -68,8 +68,8 @@ jobs:
           TARGET_MEMORY=24
 
           # 扩容路径定义
-          SCALE_OCPUS=(1 2 4)
-          SCALE_MEMORY=(6 12 24)
+          SCALE_OCPUS=(1 2)
+          SCALE_MEMORY=(6 12)
 
           # ============================================
           # 第一步：查询所有现有 A1 实例（RUNNING / STOPPED）
