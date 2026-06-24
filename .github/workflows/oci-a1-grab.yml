@@ -3,7 +3,7 @@ name: OCI A1 Instance Auto Grab
 on:
   schedule:
     # 每3分钟运行一次
-    - cron: */3 * * * *
+    - cron: '*/3 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -16,189 +16,129 @@ jobs:
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
       OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+      OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+      OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
 
     steps:
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-oci-cli-${{ runner.os }}
-
-      - name: Install OCI CLI
+      - name: Grab A1 Instance via REST API
         run: |
-          pip install oci-cli
-
-      - name: Configure OCI CLI
-        run: |
+          set +e
+          
+          # 写入私钥
           mkdir -p ~/.oci
-          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${OCI_CLI_USER}
-          fingerprint=${OCI_CLI_FINGERPRINT}
-          tenancy=${OCI_CLI_TENANCY}
-          region=${OCI_CLI_REGION}
-          key_file=~/.oci/oci_api_key.pem
-          EOF
-          chmod 600 ~/.oci/config
-          # 验证配置
-          oci iam region list --output table
-
-      - name: Grab or Scale A1 Instance
-        env:
-          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
-          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
-          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-        run: |
-          set +e  # 不因命令失败而退出
-
-          TARGET_OCPUS=4
-          TARGET_MEMORY=24
-
-          # 扩容路径定义
-          SCALE_OCPUS=(1 2)
-          SCALE_MEMORY=(6 12)
-
-          # ============================================
-          # 第一步：查询所有现有 A1 实例（RUNNING / STOPPED）
-          # ============================================
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          
+          # 安装 jq 和 openssl（通常已有）
+          which jq >/dev/null 2>&1 || sudo apt-get install -y jq >/dev/null 2>&1
+          
+          # OCI API 签名函数
+          oci_sign() {
+            local method="$1" url_path="$2" body="$3"
+            local date_now=$(date -u '+%a, %d %b %Y %H:%M:%S GMT')
+            local host="iaas.${OCI_CLI_REGION}.oraclecloud.com"
+            local sig_headers="date request-target host"
+            local request_target="${method,,} ${url_path}"
+            
+            local sign_string="date: ${date_now}
+          request-target: ${request_target}
+          host: ${host}"
+            
+            if [ "$method" = "POST" ] || [ "$method" = "PUT" ]; then
+              sign_string="${sign_string}
+          content-length: ${#body}
+          content-type: application/json"
+              sig_headers="date request-target host content-length content-type"
+            fi
+            
+            local signature=$(echo -n "$sign_string" | openssl dgst -sha256 -sign ~/.oci/key.pem | base64 -w0)
+            
+            echo "keyId=\"${OCI_CLI_TENANCY}/${OCI_CLI_USER}/${OCI_CLI_FINGERPRINT}\",algorithm=\"rsa-sha256\",headers=\"${sig_headers}\",signature=\"${signature}\""
+          }
+          
+          # GET 请求
+          oci_get() {
+            local url_path="$1"
+            local auth=$(oci_sign GET "$url_path")
+            curl -s -w "\n%{http_code}" \
+              -H "date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
+              -H "host: iaas.${OCI_CLI_REGION}.oraclecloud.com" \
+              -H "authorization: Signature ${auth}" \
+              "https://iaas.${OCI_CLI_REGION}.oraclecloud.com${url_path}"
+          }
+          
+          # POST 请求
+          oci_post() {
+            local url_path="$1" body="$2"
+            local auth=$(oci_sign POST "$url_path" "$body")
+            curl -s -w "\n%{http_code}" \
+              -X POST \
+              -H "date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
+              -H "host: iaas.${OCI_CLI_REGION}.oraclecloud.com" \
+              -H "content-type: application/json" \
+              -H "content-length: ${#body}" \
+              -H "authorization: Signature ${auth}" \
+              -d "$body" \
+              "https://iaas.${OCI_CLI_REGION}.oraclecloud.com${url_path}"
+          }
+          
           echo "=== 检查现有 A1 实例 ==="
-
-          INSTANCE_ID=""
-          INSTANCE_STATE=""
-
-          for STATE_FILTER in RUNNING STOPPED; do
-            RESULT=$(oci compute instance list \
-              --compartment-id "$OCI_COMPARTMENT_ID" \
-              --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
-              --lifecycle-state "$STATE_FILTER" \
-              --query "data[?\"shape\"=='VM.Standard.A1.Flex']" \
-              2>&1)
-            ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
-            if [ -n "$ID" ]; then
-              INSTANCE_ID="$ID"
-              INSTANCE_STATE="$STATE_FILTER"
-              echo "发现 ${STATE_FILTER} 状态的 A1 实例: $INSTANCE_ID"
-              break
-            fi
-          done
-
-          # ============================================
-          # 第二步：无实例 → 尝试创建 1C/6G
-          # ============================================
-          if [ -z "$INSTANCE_ID" ]; then
-            echo "=== 无现有 A1 实例，尝试创建 ==="
-            echo "尝试创建 ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G 实例..."
-
-            CREATE_RESULT=$(oci compute instance launch \
-              --compartment-id "$OCI_COMPARTMENT_ID" \
-              --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
-              --image-id "$OCI_IMAGE_ID" \
-              --subnet-id "$OCI_SUBNET_ID" \
-              --assign-public-ip true \
-              --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
-              --display-name "A1-Auto-Grabbed" \
-              2>&1)
-
-            if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
-              INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
-              echo "实例创建成功! ID: $INSTANCE_ID"
-              echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
-              echo "本次创建完成，等待下次运行再扩容。"
-              exit 0
-            else
-              echo "创建失败:"
-              echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT"
-              echo "下次运行将重试。"
-              exit 0
-            fi
-          fi
-
-          # ============================================
-          # 第三步：已有实例 → 检查配置并尝试扩容
-          # ============================================
-          echo "=== 检查实例当前配置 ==="
-          CURRENT_CONFIG=$(oci compute instance get \
-            --instance-id "$INSTANCE_ID" \
-            --query 'data."shape-config"' \
-            2>&1)
-
-          CURRENT_OCPUS=$(echo "$CURRENT_CONFIG" | jq -r '.ocpus // 0' 2>/dev/null)
-          CURRENT_MEMORY=$(echo "$CURRENT_CONFIG" | jq -r '."memory-in-gbs" // 0' 2>/dev/null)
-
-          # 转为整数比较
-          CURRENT_OCPUS=${CURRENT_OCPUS%.*}
-          CURRENT_MEMORY=${CURRENT_MEMORY%.*}
-
-          echo "当前配置: ${CURRENT_OCPUS}C / ${CURRENT_MEMORY}G"
-          echo "目标配置: ${TARGET_OCPUS}C / ${TARGET_MEMORY}G"
-
-          if [ "$CURRENT_OCPUS" -ge "$TARGET_OCPUS" ] 2>/dev/null; then
-            echo "已达到目标配置，无需扩容。"
-            # 如果实例是 STOPPED 的，启动它
-            if [ "$INSTANCE_STATE" = "STOPPED" ]; then
-              echo "实例处于停止状态，启动实例..."
-              oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1
-            fi
-            exit 0
-          fi
-
-          # 确定下一级扩容目标
-          NEXT_OCPUS=$TARGET_OCPUS
-          NEXT_MEMORY=$TARGET_MEMORY
-          for i in "${!SCALE_OCPUS[@]}"; do
-            if [ "${SCALE_OCPUS[$i]}" -gt "$CURRENT_OCPUS" ] 2>/dev/null; then
-              NEXT_OCPUS=${SCALE_OCPUS[$i]}
-              NEXT_MEMORY=${SCALE_MEMORY[$i]}
-              break
-            fi
-          done
-
-          echo "=== 尝试扩容到 ${NEXT_OCPUS}C / ${NEXT_MEMORY}G ==="
-
-          # 如果实例在运行，先停止
-          if [ "$INSTANCE_STATE" = "RUNNING" ]; then
-            echo "停止实例以进行扩容..."
-            oci compute instance action --instance-id "$INSTANCE_ID" --action SOFTSTOP 2>&1
-            echo "等待实例停止..."
-            sleep 60
-
-            # 确认实例已停止
-            for i in $(seq 1 10); do
-              STATE=$(oci compute instance get \
-                --instance-id "$INSTANCE_ID" \
-                --query 'data."lifecycle-state"' \
-                --raw-output 2>&1)
-              echo "实例状态: $STATE"
-              if [ "$STATE" = "STOPPED" ]; then
-                break
+          
+          # 查询 RUNNING 和 STOPPED 的实例
+          for STATE in RUNNING STOPPED; do
+            RESPONSE=$(oci_get "/20160918/instances?compartmentId=${OCI_COMPARTMENT_ID}&availabilityDomain=${OCI_AVAILABILITY_DOMAIN}&lifecycleState=${STATE}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              INSTANCE_ID=$(echo "$BODY" | jq -r '.[] | select(.shape=="VM.Standard.A1.Flex") | .id' | head -1)
+              if [ -n "$INSTANCE_ID" ]; then
+                echo "发现 ${STATE} 状态的 A1 实例: $INSTANCE_ID"
+                echo "已有实例，无需创建。"
+                exit 0
               fi
-              sleep 15
-            done
-          fi
-
-          echo "修改实例配置..."
-          UPDATE_RESULT=$(oci compute instance update \
-            --instance-id "$INSTANCE_ID" \
-            --shape-config "{\"ocpus\": ${NEXT_OCPUS}, \"memoryInGBs\": ${NEXT_MEMORY}}" \
-            --force \
-            2>&1)
-
-          if echo "$UPDATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
-            echo "扩容成功! 新配置: ${NEXT_OCPUS}C / ${NEXT_MEMORY}G"
+            fi
+          done
+          
+          echo "=== 无现有 A1 实例，尝试创建 ==="
+          
+          # 构建创建请求
+          CREATE_BODY=$(cat << EOF
+          {
+            "compartmentId": "${OCI_COMPARTMENT_ID}",
+            "availabilityDomain": "${OCI_AVAILABILITY_DOMAIN}",
+            "shape": "VM.Standard.A1.Flex",
+            "shapeConfig": {
+              "ocpus": 1,
+              "memoryInGBs": 6
+            },
+            "imageId": "${OCI_IMAGE_ID}",
+            "subnetId": "${OCI_SUBNET_ID}",
+            "assignPublicIp": true,
+            "displayName": "A1-Auto-Grabbed",
+            "metadata": {
+              "ssh_authorized_keys": "${OCI_SSH_PUBLIC_KEY}"
+            }
+          }
+          EOF
+          )
+          
+          RESPONSE=$(oci_post "/20160918/instances" "$CREATE_BODY")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            INSTANCE_ID=$(echo "$BODY" | jq -r '.id')
+            echo "🎉 实例创建成功! ID: $INSTANCE_ID"
+            echo "配置: 1C / 6G"
           else
-            echo "扩容失败:"
-            echo "$UPDATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$UPDATE_RESULT"
+            ERROR_MSG=$(echo "$BODY" | jq -r '.message // empty' 2>/dev/null)
+            if [ -n "$ERROR_MSG" ]; then
+              echo "创建失败: $ERROR_MSG"
+            else
+              echo "创建失败 (HTTP $HTTP_CODE)"
+            fi
           fi
-
-          echo "启动实例..."
-          oci compute instance action --instance-id "$INSTANCE_ID" --action START 2>&1
-          echo "实例启动命令已发送。"
-
-          echo "=== 完成 ==="
-          exit 0
