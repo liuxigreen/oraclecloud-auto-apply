@@ -99,7 +99,6 @@ jobs:
           for STATE_FILTER in RUNNING STOPPED; do
             RESULT=$(oci compute instance list \
               --compartment-id "$OCI_COMPARTMENT_ID" \
-              --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
               --lifecycle-state "$STATE_FILTER" \
               --query "data[?\"shape\"=='VM.Standard.A1.Flex']" \
               2>&1)
@@ -119,29 +118,36 @@ jobs:
             echo "=== 无现有 A1 实例，尝试创建 ==="
             echo "尝试创建 ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G 实例..."
 
-            CREATE_RESULT=$(oci compute instance launch \
-              --compartment-id "$OCI_COMPARTMENT_ID" \
-              --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
-              --image-id "$OCI_IMAGE_ID" \
-              --subnet-id "$OCI_SUBNET_ID" \
-              --assign-public-ip true \
-              --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
-              --display-name "A1-Auto-Grabbed" \
-              2>&1)
+            # OCI_AVAILABILITY_DOMAIN 支持逗号分隔多值（如 "kWHb:PHX-AD-1,kWHb:PHX-AD-2"），逐个尝试
+            IFS=',' read -ra AD_LIST <<< "$OCI_AVAILABILITY_DOMAIN"
+            CREATE_SUCCESS=0
+            for AD in "${AD_LIST[@]}"; do
+              AD=$(echo "$AD" | xargs)
+              [ -z "$AD" ] && continue
+              echo "--- 尝试 $AD ---"
+              CREATE_RESULT=$(oci compute instance launch \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
+                --image-id "$OCI_IMAGE_ID" \
+                --subnet-id "$OCI_SUBNET_ID" \
+                --assign-public-ip true \
+                --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
+                --display-name "A1-Auto-Grabbed" \
+                2>&1)
 
-            if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
-              INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
-              echo "实例创建成功! ID: $INSTANCE_ID"
-              echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
-              echo "本次创建完成，等待下次运行再扩容。"
-              exit 0
-            else
-              echo "创建失败:"
+              if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
+                INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
+                echo "实例创建成功! ID: $INSTANCE_ID (AD: $AD)"
+                echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
+                CREATE_SUCCESS=1
+                break
+              fi
+              echo "创建失败 ($AD):"
               echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT"
-              echo "下次运行将重试。"
-              exit 0
+            done
+            exit 0
             fi
           fi
 
