@@ -154,11 +154,14 @@ jobs:
                   CREATE_SUCCESS=1
                   break
                 fi
-                ERR_CODE=$(echo "$CREATE_RESULT" | jq -r '.code // empty' 2>/dev/null)
-                ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.message // empty' 2>/dev/null)
-                echo "创建失败 ($AD): $ERR_CODE $ERR_MSG"
-                # 限速检测：触发则本轮立即退避，避免连续踩限速
-                if echo "$ERR_CODE $ERR_MSG" | grep -qiE "TooManyRequests|429|throttl|rate.?limit"; then
+                # 错误处理：OCI CLI 报错时输出 "ServiceError:" 文本(非纯JSON)，jq 解析不到。
+                # 直接 grep 原始输出里的错误码，兼容 ServiceError 文本格式。
+                ERR_CODE=$(echo "$CREATE_RESULT" | grep -oE '"code": "[^"]+"' | head -1 | sed 's/.*"code": "//;s/"//')
+                ERR_MSG=$(echo "$CREATE_RESULT" | grep -oE '"message": "[^"]+"' | head -1 | sed 's/.*"message": "//;s/"$//')
+                [ -z "$ERR_CODE" ] && ERR_CODE=$(echo "$CREATE_RESULT" | grep -oiE "Out of host capacity|TooManyRequests|InternalError|LimitExceeded|NotAuthorized" | head -1)
+                echo "创建失败 ($AD): ${ERR_CODE:-未知错误} ${ERR_MSG}"
+                # 限速检测：直接对整个原始输出 grep，兼容 ServiceError 文本格式
+                if echo "$CREATE_RESULT" | grep -qiE "TooManyRequests|\"status\": 429|throttl|rate.?limit|exceeded maximum"; then
                   echo "触发限速，退避 ${RATE_LIMIT_BACKOFF_SEC}s..."
                   RATE_LIMITED=1
                   break
