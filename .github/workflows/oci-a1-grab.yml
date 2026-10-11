@@ -121,34 +121,64 @@ jobs:
             # OCI_AVAILABILITY_DOMAIN 支持逗号分隔多值（如 "kWHb:PHX-AD-1,kWHb:PHX-AD-2"），逐个尝试
             IFS=',' read -ra AD_LIST <<< "$OCI_AVAILABILITY_DOMAIN"
             CREATE_SUCCESS=0
-            for AD in "${AD_LIST[@]}"; do
-              AD=$(echo "$AD" | xargs)
-              [ -z "$AD" ] && continue
-              echo "--- 尝试 $AD ---"
-              CREATE_RESULT=$(oci compute instance launch \
-                --compartment-id "$OCI_COMPARTMENT_ID" \
-                --availability-domain "$AD" \
-                --shape "VM.Standard.A1.Flex" \
-                --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
-                --image-id "$OCI_IMAGE_ID" \
-                --subnet-id "$OCI_SUBNET_ID" \
-                --assign-public-ip true \
-                --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
-                --display-name "A1-Auto-Grabbed" \
-                2>&1)
+            # 容量是瞬时闪现的：在时间预算内对每个 AD 循环重试，命中概率远高于每 AD 只试一次。
+            # 限速保护：间隔 20s（约3次/分，远低于OCI限速阈值）；一旦返回 429/TooManyRequests 立即退避 60s。
+            RETRY_BUDGET_SEC=600
+            RETRY_INTERVAL_SEC=20
+            RATE_LIMIT_BACKOFF_SEC=60
+            START_TS=$(date +%s)
+            ROUND=0
+            while [ "$CREATE_SUCCESS" -eq 0 ]; do
+              ROUND=$((ROUND + 1))
+              RATE_LIMITED=0
+              for AD in "${AD_LIST[@]}"; do
+                AD=$(echo "$AD" | xargs)
+                [ -z "$AD" ] && continue
+                echo "--- 第 ${ROUND} 轮 尝试 $AD ---"
+                CREATE_RESULT=$(oci compute instance launch \
+                  --compartment-id "$OCI_COMPARTMENT_ID" \
+                  --availability-domain "$AD" \
+                  --shape "VM.Standard.A1.Flex" \
+                  --shape-config "{\"ocpus\": ${SCALE_OCPUS[0]}, \"memoryInGBs\": ${SCALE_MEMORY[0]}}" \
+                  --image-id "$OCI_IMAGE_ID" \
+                  --subnet-id "$OCI_SUBNET_ID" \
+                  --assign-public-ip true \
+                  --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
+                  --display-name "A1-Auto-Grabbed" \
+                  2>&1)
 
-              if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
-                INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
-                echo "实例创建成功! ID: $INSTANCE_ID (AD: $AD)"
-                echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
-                CREATE_SUCCESS=1
+                if echo "$CREATE_RESULT" | jq -e '.data.id' > /dev/null 2>&1; then
+                  INSTANCE_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id')
+                  echo "实例创建成功! ID: $INSTANCE_ID (AD: $AD)"
+                  echo "当前配置: ${SCALE_OCPUS[0]}C / ${SCALE_MEMORY[0]}G"
+                  CREATE_SUCCESS=1
+                  break
+                fi
+                ERR_CODE=$(echo "$CREATE_RESULT" | jq -r '.code // empty' 2>/dev/null)
+                ERR_MSG=$(echo "$CREATE_RESULT" | jq -r '.message // empty' 2>/dev/null)
+                echo "创建失败 ($AD): $ERR_CODE $ERR_MSG"
+                # 限速检测：触发则本轮立即退避，避免连续踩限速
+                if echo "$ERR_CODE $ERR_MSG" | grep -qiE "TooManyRequests|429|throttl|rate.?limit"; then
+                  echo "触发限速，退避 ${RATE_LIMIT_BACKOFF_SEC}s..."
+                  RATE_LIMITED=1
+                  break
+                fi
+              done
+              [ "$CREATE_SUCCESS" -eq 1 ] && break
+              NOW_TS=$(date +%s)
+              ELAPSED=$((NOW_TS - START_TS))
+              if [ "$ELAPSED" -ge "$RETRY_BUDGET_SEC" ]; then
+                echo "已达重试时间预算，本次退出，等待下一轮调度。"
                 break
               fi
-              echo "创建失败 ($AD):"
-              echo "$CREATE_RESULT" | jq -r '.code // empty, .message // empty' 2>/dev/null || echo "$CREATE_RESULT"
+              if [ "$RATE_LIMITED" -eq 1 ]; then
+                sleep "$RATE_LIMIT_BACKOFF_SEC"
+              else
+                echo "本轮全部 AD 失败，已用 ${ELAPSED}s / ${RETRY_BUDGET_SEC}s，${RETRY_INTERVAL_SEC}s 后重试..."
+                sleep "$RETRY_INTERVAL_SEC"
+              fi
             done
             exit 0
-            fi
           fi
 
           # ============================================
